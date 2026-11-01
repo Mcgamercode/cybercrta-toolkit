@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # CYBERCRTA - Critical Thinking & Recon Toolkit
-# Version: v1.0.0
+# Version: v1.1.0
 #
 # Target Environment: Ubuntu on WSL2 / Linux.
 # Dependencies: bash, curl, dnsutils, nmap, whois, netcat-openbsd.
@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-VERSION="v1.0.0"
+VERSION="v1.1.0"
 SCRIPT_NAME=$(basename "$0")
 
 # ANSI Color codes (raw escapes for maximum portability without tput dependency)
@@ -118,6 +118,10 @@ declare -A REQUIRED_TOOLS=(
     ["nc"]="netcat-openbsd"
 )
 
+# Associative arrays iterate in nondeterministic order; this ordered list
+# keeps the dependency audit display stable run to run.
+REQUIRED_TOOLS_ORDER=("nmap" "dig" "curl" "whois" "nc")
+
 is_command_available() {
     local cmd="$1"
     command -v "$cmd" >/dev/null 2>&1
@@ -140,7 +144,7 @@ check_dependencies() {
     local missing_pkgs=()
 
     echo -e "${COLOR_BLUE}${COLOR_BOLD}[ Dependency Audit ]${COLOR_RESET}"
-    for cmd in "${!REQUIRED_TOOLS[@]}"; do
+    for cmd in "${REQUIRED_TOOLS_ORDER[@]}"; do
         local pkg="${REQUIRED_TOOLS[$cmd]}"
         if is_command_available "$cmd"; then
             echo -e "  ${COLOR_GREEN}✓${COLOR_RESET} ${cmd} (${pkg}): ${COLOR_GREEN}Installed${COLOR_RESET}"
@@ -197,6 +201,19 @@ sanitize_input() {
     echo "$input" | tr -d ';&|`$><' | xargs
 }
 
+sanitize_url() {
+    # URL-safe variant: keeps query-string characters (& ? = % + # ~)
+    # that sanitize_input would strip, while still removing shell
+    # metacharacters and control characters. Always use quoted "$url".
+    local input="$1"
+    echo "$input" | tr -d ';\|`$><' | tr -d '\000-\010\013\014\016-\037\177' | xargs
+}
+
+grep_supports_pcre() {
+    # PCRE (-P) is not guaranteed in every grep build; test before use.
+    printf '' | grep -P -q "" 2>/dev/null
+}
+
 validate_host_or_ip() {
     local target="$1"
     # Basic domain or IPv4 validation
@@ -232,18 +249,22 @@ network_ping_sweep() {
         range_end=15
     fi
 
-    print_info "Sweeping ${subnet}.1 to ${subnet}.${range_end} (timeout 1s per host)..."
+    print_info "Sweeping ${subnet}.1 to ${subnet}.${range_end} ..."
     local active_count=0
-    for i in $(seq 1 "$range_end"); do
-        local target="${subnet}.${i}"
-        # Ping with 1 packet, 1 second deadline/timeout
-        if ping -c 1 -W 1 "$target" >/dev/null 2>&1; then
-            echo -e "  ${COLOR_GREEN}[ONLINE]${COLOR_RESET}  ${target}"
+    if command -v fping >/dev/null 2>&1; then
+        # fping is the fast path: parallel by design, sweeps a /24 in seconds.
+        # (Install: sudo apt install -y fping)
+        while IFS= read -r host; do
+            echo -e "  ${COLOR_GREEN}[ONLINE]${COLOR_RESET}  ${host}"
             ((active_count++))
-        else
-            echo -e "  ${COLOR_GRAY}[DOWN/NO-RESP]${COLOR_RESET} ${target}"
-        fi
-    done
+        done < <(fping -a -g "${subnet}.1" "${subnet}.${range_end}" 2>/dev/null)
+    else
+        # No fping: fan ping out in 64 parallel workers instead of sequentially.
+        while IFS= read -r host; do
+            echo -e "  ${COLOR_GREEN}[ONLINE]${COLOR_RESET}  ${host}"
+            ((active_count++))
+        done < <(seq 1 "$range_end" | xargs -P 64 -I{} sh -c "ping -c1 -W1 ${subnet}.{} >/dev/null 2>&1 && echo ${subnet}.{}" 2>/dev/null)
+    fi
 
     echo
     print_success "Ping sweep completed. Found ${active_count} responsive host(s)."
@@ -405,7 +426,7 @@ dns_dig_lookup() {
 
     echo
     echo "Select Record Type:"
-    echo "  1) ANY (A, AAAA, MX, TXT, NS)"
+    echo "  1) ALL (A, AAAA, MX, TXT, NS)"
     echo "  2) A (IPv4 Address)"
     echo "  3) AAAA (IPv6 Address)"
     echo "  4) MX (Mail Exchange)"
@@ -415,25 +436,31 @@ dns_dig_lookup() {
     echo -ne "${COLOR_BOLD}Choose record [1-7] (default: 1): ${COLOR_RESET}"
     read -r rtype_opt
 
-    local qtype="ANY"
+    # NOTE: qtype ANY is intentionally avoided — most public resolvers
+    # (Cloudflare 1.1.1.1, Google 8.8.8.8) refuse ANY queries, so option 1
+    # queries each common type individually instead.
+    local qtypes=("A" "AAAA" "MX" "TXT" "NS")
     local extra_flags="+time=3 +tries=2"
 
     case "$rtype_opt" in
-        2) qtype="A" ;;
-        3) qtype="AAAA" ;;
-        4) qtype="MX" ;;
-        5) qtype="TXT" ;;
-        6) qtype="NS" ;;
-        7) qtype="A"; extra_flags="+trace +nodnssec +time=3 +tries=1" ;;
-        *) qtype="ANY" ;;
+        2) qtypes=("A") ;;
+        3) qtypes=("AAAA") ;;
+        4) qtypes=("MX") ;;
+        5) qtypes=("TXT") ;;
+        6) qtypes=("NS") ;;
+        7) qtypes=("A"); extra_flags="+trace +nodnssec +time=3 +tries=1" ;;
     esac
 
-    print_info "Running: dig ${domain} ${qtype} ${extra_flags}"
     echo "------------------------------------------------------------"
-    # shellcheck disable=SC2086
-    if ! timeout 15s dig "$domain" $qtype $extra_flags +noall +answer +comments 2>&1; then
-        print_error "DNS query timed out or failed. WSL2 /etc/resolv.conf might need checking."
-    fi
+    local qtype
+    for qtype in "${qtypes[@]}"; do
+        print_info "Running: dig ${domain} ${qtype} ${extra_flags}"
+        # shellcheck disable=SC2086
+        if ! timeout 15s dig "$domain" "$qtype" $extra_flags +noall +answer +comments 2>&1; then
+            print_error "DNS query (${qtype}) timed out or failed. WSL2 /etc/resolv.conf might need checking."
+        fi
+        echo
+    done
     echo "------------------------------------------------------------"
     pause_prompt
 }
@@ -533,7 +560,7 @@ web_headers_inspection() {
 
     echo -ne "${COLOR_BOLD}Enter URL or Domain (e.g. https://example.com or localhost:8080): ${COLOR_RESET}"
     read -r target
-    target=$(sanitize_input "$target")
+    target=$(sanitize_url "$target")
 
     if [ -z "$target" ]; then
         print_error "Target URL cannot be empty."
@@ -578,7 +605,7 @@ web_redirect_trace() {
 
     echo -ne "${COLOR_BOLD}Enter URL to trace (e.g. http://google.com): ${COLOR_RESET}"
     read -r target
-    target=$(sanitize_input "$target")
+    target=$(sanitize_url "$target")
 
     if [ -z "$target" ]; then
         print_error "Target URL cannot be empty."
@@ -615,7 +642,7 @@ web_tech_fingerprint() {
 
     echo -ne "${COLOR_BOLD}Enter URL to inspect (e.g. https://example.com): ${COLOR_RESET}"
     read -r target
-    target=$(sanitize_input "$target")
+    target=$(sanitize_url "$target")
 
     if [ -z "$target" ]; then
         print_error "Target cannot be empty."
@@ -640,12 +667,154 @@ web_tech_fingerprint() {
     echo -e "${COLOR_BOLD}Server Banner:${COLOR_RESET}   ${server_header}"
     echo -e "${COLOR_BOLD}Backend Engine:${COLOR_RESET}  ${powered_by}"
 
-    local page_title
-    page_title=$(curl -sL --max-time 10 "$target" 2>/dev/null | grep -ioP '(?<=<title>)(.*)(?=</title>)' | head -n 1)
+    local page_html page_title=""
+    page_html=$(curl -sL --max-time 10 "$target" 2>/dev/null)
+    if grep_supports_pcre; then
+        page_title=$(printf '%s' "$page_html" | grep -ioP '(?<=<title>)(.*)(?=</title>)' | head -n 1)
+    else
+        # Portable fallback when grep lacks PCRE: collapse to one line, sed-extract.
+        page_title=$(printf '%s' "$page_html" | tr '\n' ' ' | sed -n 's/.*<[Tt][Ii][Tt][Ll][Ee]>\([^<]*\)<\/[Tt][Ii][Tt][Ll][Ee]>.*/\1/p' | head -n 1 | xargs)
+    fi
     if [ -n "$page_title" ]; then
         echo -e "${COLOR_BOLD}Page Title:${COLOR_RESET}      ${page_title}"
     fi
 
+    echo "------------------------------------------------------------"
+    pause_prompt
+}
+
+web_ollama_audit() {
+    print_header "Web Recon: Ollama AI Security Analysis"
+    if ! ensure_tool_or_warn "curl"; then
+        pause_prompt
+        return
+    fi
+
+    # 1. Is the Ollama daemon reachable? Never fail hard if it isn't.
+    if ! curl -s --max-time 3 http://localhost:11434/api/tags >/dev/null 2>&1; then
+        print_error "Ollama service not detected at http://localhost:11434."
+        print_info "Install it:   curl -fsSL https://ollama.com/install.sh | sh"
+        print_info "Pull a model: ollama pull qwen2.5-coder:7b   (or: ollama pull llama3)"
+        print_info "Then start:   ollama serve"
+        pause_prompt
+        return
+    fi
+    print_success "Ollama service detected."
+
+    # 2. List installed models and let the user pick.
+    local tags_json model_list
+    tags_json=$(curl -s --max-time 5 http://localhost:11434/api/tags 2>/dev/null)
+    model_list=$(printf '%s' "$tags_json" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -z "$model_list" ]; then
+        print_error "Ollama is running but no models are installed."
+        print_info "Pull one first:  ollama pull qwen2.5-coder:7b"
+        pause_prompt
+        return
+    fi
+
+    echo "Installed models:"
+    local i=1 m
+    local models=()
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        echo "  $i) $m"
+        models+=("$m")
+        ((i++))
+    done <<< "$model_list"
+
+    local model=""
+    if [ "${#models[@]}" -eq 1 ]; then
+        model="${models[0]}"
+    else
+        # Prefer qwen2.5-coder:7b when it's there; otherwise ask.
+        for m in "${models[@]}"; do
+            if [[ "$m" == "qwen2.5-coder:7b"* ]]; then model="$m"; break; fi
+        done
+        if [ -z "$model" ]; then
+            local model_choice
+            echo -ne "${COLOR_BOLD}Choose model [1-${#models[@]}] (default: 1): ${COLOR_RESET}"
+            read -r model_choice
+            model_choice=${model_choice:-1}
+            if [[ "$model_choice" =~ ^[0-9]+$ ]] && [ "$model_choice" -ge 1 ] && [ "$model_choice" -le "${#models[@]}" ]; then
+                model="${models[$((model_choice-1))]}"
+            else
+                model="${models[0]}"
+                print_warn "Invalid choice; using ${model}."
+            fi
+        fi
+    fi
+    print_info "Using model: ${model}"
+
+    # 3. Target URL + header grab.
+    echo -ne "${COLOR_BOLD}Enter URL to analyze (e.g. https://example.com): ${COLOR_RESET}"
+    read -r target
+    target=$(sanitize_url "$target")
+    if [ -z "$target" ]; then
+        print_error "Target URL cannot be empty."
+        pause_prompt
+        return
+    fi
+    if ! [[ "$target" =~ ^https?:// ]]; then
+        target="http://${target}"
+    fi
+
+    print_info "Grabbing headers from ${target} ..."
+    local headers
+    headers=$(curl -sSL -D - -o /dev/null --max-time 15 "$target" 2>/dev/null)
+    if [ -z "$headers" ]; then
+        print_error "Could not fetch headers from ${target}."
+        pause_prompt
+        return
+    fi
+
+    # 4. JSON tooling: prefer jq, fall back to python3.
+    local json_tool=""
+    if command -v jq >/dev/null 2>&1; then
+        json_tool="jq"
+    elif command -v python3 >/dev/null 2>&1; then
+        json_tool="python3"
+    else
+        print_error "Need jq or python3 to talk to the Ollama API."
+        print_info "Install one: sudo apt install -y jq"
+        pause_prompt
+        return
+    fi
+
+    local prompt="You are a cybersecurity analyst. Analyze these HTTP response headers for missing security controls, information disclosure (server banners, powered-by headers), and risky configurations. Be concise and actionable, use bullet points:\n\n${headers}"
+    local payload
+    if [ "$json_tool" = "jq" ]; then
+        payload=$(jq -n --arg model "$model" --arg prompt "$prompt" '{model:$model, prompt:$prompt, stream:false}')
+    else
+        payload=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1], "prompt": sys.argv[2], "stream": False}))' "$model" "$prompt")
+    fi
+
+    print_info "Querying Ollama (model: ${model}) — local inference can take a minute ..."
+    local resp
+    resp=$(curl -s -X POST http://localhost:11434/api/generate \
+        --max-time 180 -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null)
+    if [ -z "$resp" ]; then
+        print_error "No response from Ollama (timed out or connection dropped)."
+        pause_prompt
+        return
+    fi
+
+    local answer=""
+    if [ "$json_tool" = "jq" ]; then
+        answer=$(printf '%s' "$resp" | jq -r '.response // empty' 2>/dev/null)
+    else
+        answer=$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("response",""))' 2>/dev/null)
+    fi
+
+    echo
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}=== Ollama Security Analysis ===${COLOR_RESET}"
+    if [ -n "$answer" ]; then
+        printf '%s\n' "$answer"
+    else
+        print_warn "Ollama returned an unreadable response. Raw output (first 20 lines):"
+        printf '%s\n' "$resp" | head -n 20
+    fi
     echo "------------------------------------------------------------"
     pause_prompt
 }
@@ -656,16 +825,18 @@ menu_web_recon() {
         echo "  1) HTTP Header Inspection & Security Header Audit"
         echo "  2) HTTP Redirection & Timing Trace"
         echo "  3) Server & Technology Fingerprinting"
-        echo "  4) Return to Main Menu"
+        echo "  4) AI Security Analysis (Ollama, local LLM)"
+        echo "  5) Return to Main Menu"
         echo
-        echo -ne "${COLOR_BOLD}Enter choice [1-4]: ${COLOR_RESET}"
+        echo -ne "${COLOR_BOLD}Enter choice [1-5]: ${COLOR_RESET}"
         read -r choice
         case "$choice" in
             1) web_headers_inspection ;;
             2) web_redirect_trace ;;
             3) web_tech_fingerprint ;;
-            4) break ;;
-            *) print_warn "Invalid selection. Please choose 1-4."; sleep 1 ;;
+            4) web_ollama_audit ;;
+            5) break ;;
+            *) print_warn "Invalid selection. Please choose 1-5."; sleep 1 ;;
         esac
     done
 }
@@ -805,7 +976,7 @@ main_menu() {
         echo -e "${COLOR_BOLD}MAIN NAVIGATION:${COLOR_RESET}"
         echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Network Recon       ${COLOR_GRAY}(Ping Sweep, Nmap Port Scan, Netcat Probe)${COLOR_RESET}"
         echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} DNS Lookup          ${COLOR_GRAY}(Dig Records, Reverse PTR, WHOIS Intelligence)${COLOR_RESET}"
-        echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Web Recon           ${COLOR_GRAY}(HTTP Headers, Redirect Trace, Tech Fingerprint)${COLOR_RESET}"
+        echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Web Recon           ${COLOR_GRAY}(HTTP Headers, Redirect Trace, Tech Fingerprint, Ollama AI)${COLOR_RESET}"
         echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Learning Hub        ${COLOR_GRAY}(Tool Explainers, Recon Logic & Methodologies)${COLOR_RESET}"
         echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} System Dependencies ${COLOR_GRAY}(Audit and Install Missing Packages)${COLOR_RESET}"
         echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} Exit"

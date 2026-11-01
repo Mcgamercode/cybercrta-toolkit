@@ -86,12 +86,12 @@ CYBERCRTA supports several non-interactive CLI flags:
 ```text
 CYBERCRTA Main Menu
 ├── 1) Network Recon
-│   ├── 1) Subnet Ping Sweep (WSL2-safe 1s timeouts)
+│   ├── 1) Subnet Ping Sweep (fping preferred, parallel ping fallback)
 │   ├── 2) Nmap Port Scanner (TCP Connect -sT, Quick/Standard/Version/Custom)
 │   ├── 3) Netcat Quick Port Probe & Banner Grab
 │   └── 4) Return to Main Menu
 ├── 2) DNS Lookup
-│   ├── 1) Dig DNS Record Lookup (ANY, A, AAAA, MX, TXT, NS, +trace)
+│   ├── 1) Dig DNS Record Lookup (ALL types individually, +trace)
 │   ├── 2) Reverse DNS Lookup (PTR via Dig)
 │   ├── 3) WHOIS Domain / IP Intelligence (Key fields + raw view)
 │   └── 4) Return to Main Menu
@@ -99,7 +99,8 @@ CYBERCRTA Main Menu
 │   ├── 1) HTTP Header Inspection & Security Header Audit (HSTS, CSP, XFO, etc.)
 │   ├── 2) HTTP Redirection & Timing Trace (Status code, redirects, connect timing)
 │   ├── 3) Server & Technology Fingerprinting (Server, X-Powered-By, Title)
-│   └── 4) Return to Main Menu
+│   ├── 4) AI Security Analysis (Ollama, local LLM)
+│   └── 5) Return to Main Menu
 ├── 4) Learning Hub
 │   ├── 1) Ping & ICMP Architecture (WSL2 considerations)
 │   ├── 2) Nmap Port Scanning & Port States
@@ -113,6 +114,27 @@ CYBERCRTA Main Menu
 │   └── Run live audit and offer 'sudo apt install -y' for missing packages
 └── 6) Exit
 ```
+
+---
+
+## Ollama AI Security Analysis (v1.1.0+)
+
+Web Recon → option 4 pipes captured HTTP headers into a **local** Ollama model
+for an AI security audit (missing headers, banner disclosure, risky configs).
+Nothing leaves your machine.
+
+Setup:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5-coder:7b   # or: ollama pull llama3
+ollama serve
+```
+
+The toolkit auto-detects the daemon at `http://localhost:11434`, lists your
+installed models (preferring `qwen2.5-coder:7b` when present), and degrades
+gracefully with install instructions if Ollama isn't running. Needs `jq` or
+`python3` for JSON handling.
 
 ---
 
